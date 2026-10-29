@@ -1,8 +1,9 @@
 // Offline support: network-first for app files (so updates show up), cache fallback when offline.
-const CACHE = 'fitlog-v1';
+// Versioned SDK files (Firebase, Anthropic) are cached on first use so they load offline too.
+const CACHE = 'fitlog-v3';
 const ASSETS = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
-  'js/app.js', 'js/ai.js', 'js/calc.js', 'js/charts.js', 'js/db.js',
+  'js/app.js', 'js/ai.js', 'js/calc.js', 'js/charts.js', 'js/db.js', 'js/cloud.js', 'js/firebase-config.js',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
 ];
 
@@ -19,8 +20,25 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('fetch', (e) => {
+  if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
-  if (e.request.method !== 'GET' || url.origin !== self.location.origin) return; // never touch AI calls
+
+  // Versioned library files (Firebase SDK, Anthropic SDK) never change: cache-first.
+  const pinnedLib = (url.hostname === 'www.gstatic.com' && url.pathname.startsWith('/firebasejs/'))
+    || (url.hostname === 'cdn.jsdelivr.net' && url.pathname.startsWith('/npm/@anthropic-ai/sdk@'));
+  if (pinnedLib) {
+    e.respondWith(
+      caches.match(e.request).then((hit) => hit || fetch(e.request).then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE).then((c) => c.put(e.request, copy));
+        return res;
+      })),
+    );
+    return;
+  }
+
+  // Same-origin app files only; never touch AI, Firestore or sign-in traffic (incl. /__/auth/).
+  if (url.origin !== self.location.origin || url.pathname.startsWith('/__/')) return;
   e.respondWith(
     fetch(e.request)
       .then((res) => {

@@ -1,4 +1,5 @@
 import * as db from './db.js';
+import * as cloud from './cloud.js';
 import * as C from './calc.js';
 import * as AI from './ai.js';
 import { lineChart, barChart, ring } from './charts.js';
@@ -16,8 +17,8 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 const DEFAULT = {
   version: 1,
   profile: { sex: '', age: null, heightCm: null, weightKg: null, activity: 1.375, goalWeightKg: null, rate: 0.5 },
-  goals: { custom: false, kcal: 2000, protein: 120, carbs: 220, fat: 65, workoutsPerWeek: 4, eatBack: 0 },
-  settings: { apiKey: '', model: '', models: [] },
+  goals: { custom: false, kcal: 2000, protein: 120, carbs: 220, fat: 65, activeDays: 4, weeklyMinutes: 150, eatBack: 0 },
+  settings: { provider: 'gemini', apiKey: '', model: '', models: [], claudeKey: '', claudeModel: AI.DEFAULT_CLAUDE_MODEL, autoFallback: true },
   meals: [],
   workouts: [],
   weights: [],
@@ -25,27 +26,56 @@ const DEFAULT = {
 };
 
 let S;
-const ui = { tab: 'today', date: C.today(), followToday: true };
+const ui = { tab: 'today', date: C.today(), followToday: true, user: null, syncing: false };
 
 // ---------- persistence ----------
 let saveTimer;
-function save() { clearTimeout(saveTimer); saveTimer = setTimeout(flush, 150); }
-function flush() { clearTimeout(saveTimer); return db.kvSet('state', S).catch((e) => toast('Save failed: ' + e.message)); }
+// Signed in: changes go to Firestore (which caches offline). Signed out: this device's IndexedDB.
+function save() {
+  if (ui.user) return cloud.push(S);
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flush, 150);
+}
+function flush() {
+  clearTimeout(saveTimer);
+  if (ui.user) return cloud.pushNow();
+  return db.kvSet('state', S).catch((e) => toast('Save failed: ' + e.message));
+}
 function hydrateState(saved) {
   const d = clone(DEFAULT);
   if (!saved) return d;
+  const goals = { ...d.goals, ...saved.goals };
+  if (saved.goals?.workoutsPerWeek && saved.goals.activeDays == null) goals.activeDays = saved.goals.workoutsPerWeek; // v1 → days
+  delete goals.workoutsPerWeek;
   return {
     ...d, ...saved,
     profile: { ...d.profile, ...saved.profile },
-    goals: { ...d.goals, ...saved.goals },
+    goals,
     settings: { ...d.settings, ...saved.settings },
   };
 }
 
 const photoCache = new Map();
 async function getPhoto(id) {
-  if (!photoCache.has(id)) photoCache.set(id, (await db.photoGet(id).catch(() => '')) || '');
+  if (!photoCache.has(id)) {
+    let src = await db.photoGet(id).catch(() => '');
+    if (!src && ui.user) {
+      src = await cloud.photoGet(id);
+      if (src) db.photoSet(id, src).catch(() => {});
+    }
+    photoCache.set(id, src || '');
+  }
   return photoCache.get(id);
+}
+async function savePhoto(id, src) {
+  await db.photoSet(id, src);
+  photoCache.set(id, src);
+  cloud.photoSet(id, src);
+}
+function deletePhoto(id) {
+  db.photoDel(id).catch(() => {});
+  photoCache.delete(id);
+  cloud.photoDel(id);
 }
 function hydratePhotos(root) {
   $$('img[data-photo]', root).forEach(async (img) => {
@@ -64,7 +94,7 @@ function targets() {
   const calc = C.calcGoals(S.profile, curWeight());
   const g = S.goals;
   const base = g.custom || !calc ? g : calc;
-  return { kcal: base.kcal, protein: base.protein, carbs: base.carbs, fat: base.fat, calc, workoutsPerWeek: g.workoutsPerWeek, eatBack: g.eatBack };
+  return { kcal: base.kcal, protein: base.protein, carbs: base.carbs, fat: base.fat, calc, activeDays: g.activeDays, weeklyMinutes: g.weeklyMinutes, eatBack: g.eatBack };
 }
 const mealsOn = (d) => S.meals.filter((m) => m.date === d).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
 const workoutsOn = (d) => S.workouts.filter((w) => w.date === d);
@@ -76,20 +106,42 @@ function dayTotals(d) {
   return t;
 }
 function markDirty(date) { if (S.days[date]?.closed) S.days[date].stale = true; }
-function weekCount(ws) { const we = C.addDays(ws, 6); return S.workouts.filter((w) => w.date >= ws && w.date <= we).length; }
+// Workout goals are counted in active days (any workout that day) and total minutes per Mon–Sun week.
+function weekStats(ws) {
+  const we = C.addDays(ws, 6);
+  const list = S.workouts.filter((w) => w.date >= ws && w.date <= we);
+  return { days: new Set(list.map((w) => w.date)).size, minutes: list.reduce((s, w) => s + (+w.minutes || 0), 0), kcal: list.reduce((s, w) => s + (+w.kcal || 0), 0) };
+}
+function weekMet(ws) {
+  const x = weekStats(ws);
+  return x.days >= (S.goals.activeDays || 1) && x.minutes >= (S.goals.weeklyMinutes || 0);
+}
 function workoutWeekStreak() {
-  const target = S.goals.workoutsPerWeek || 1;
-  let ws = C.weekStart(C.today()), n = weekCount(ws) >= target ? 1 : 0;
+  let ws = C.weekStart(C.today()), n = weekMet(ws) ? 1 : 0;
   ws = C.addDays(ws, -7);
-  while (weekCount(ws) >= target) { n++; ws = C.addDays(ws, -7); }
+  while (weekMet(ws)) { n++; ws = C.addDays(ws, -7); }
   return n;
 }
+// A food-log day is "complete" once the user has tapped Done and received the day review.
+const isReviewed = (d) => !!S.days[d]?.closed;
 function logStreak() {
-  const has = new Set(S.meals.map((m) => m.date));
   let d = C.today(), n = 0;
-  if (!has.has(d)) d = C.addDays(d, -1);
-  while (has.has(d)) { n++; d = C.addDays(d, -1); }
+  if (!isReviewed(d)) d = C.addDays(d, -1);
+  while (isReviewed(d)) { n++; d = C.addDays(d, -1); }
   return n;
+}
+const GEAR = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>';
+const gearBtn = () => `<button class="icon-btn gear" data-act="open-settings" aria-label="Settings">${GEAR}</button>`;
+
+// 16-week calendar grid (Monday rows on top); cls(date) returns the cell's CSS class.
+function heatGrid(cls, weeks = 16) {
+  const today = C.today(), start = C.addDays(C.weekStart(today), -7 * (weeks - 1));
+  let cells = '';
+  for (let i = 0; i < weeks * 7; i++) {
+    const d = C.addDays(start, i);
+    cells += `<i class="${d > today ? 'future' : cls(d)}${d === today ? ' today' : ''}" title="${d}"></i>`;
+  }
+  return `<div class="heat">${cells}</div>`;
 }
 function dateLabel(d) {
   const diff = C.daysBetween(d, C.today());
@@ -128,7 +180,7 @@ const spinner = '<span class="spinner"></span>';
 function render() {
   if (ui.followToday) ui.date = C.today();
   const v = $('#view');
-  v.innerHTML = VIEWS[ui.tab]();
+  v.innerHTML = ui.syncing ? `<div class="boot">${spinner}<div style="margin-top:10px">Syncing your account…</div></div>` : VIEWS[ui.tab]();
   hydratePhotos(v);
   $$('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === ui.tab));
 }
@@ -142,11 +194,11 @@ function viewToday() {
   const left = budget - tot.kcal;
   const isToday = d >= C.today();
   const setup = !t.calc && !S.goals.custom
-    ? `<button class="card tight row" data-act="tab" data-tab="settings" style="width:100%;text-align:left">
+    ? `<button class="card tight row" data-act="open-settings" style="width:100%;text-align:left">
          <div class="grow"><h3>Set up your profile</h3><div class="muted sm">Get a science-based calorie goal (Mifflin-St Jeor) and progress forecast.</div></div><span class="muted">›</span></button>` : '';
-  const keyHint = !S.settings.apiKey
-    ? `<button class="card tight row" data-act="tab" data-tab="settings" style="width:100%;text-align:left">
-         <div class="grow"><h3>Add your free Gemini key</h3><div class="muted sm">Needed for photo analysis and daily reviews.</div></div><span class="muted">›</span></button>` : '';
+  const keyHint = !S.settings.apiKey && !S.settings.claudeKey
+    ? `<button class="card tight row" data-act="open-settings" style="width:100%;text-align:left">
+         <div class="grow"><h3>Add an AI key</h3><div class="muted sm">Free Gemini or paid Claude, for photo analysis and daily reviews.</div></div><span class="muted">›</span></button>` : '';
 
   const macro = (key, label, color) => {
     const v = tot[key], goal = t[key] || 1;
@@ -184,7 +236,11 @@ function viewToday() {
     reviewBlock = `<button class="btn primary block" data-act="finish-day" ${tot.meals ? '' : 'disabled'}>Done for ${isToday ? 'today' : 'this day'} · get review</button>`;
   }
 
+  const signHint = cloud.enabled && !ui.user && !hasData(S)
+    ? `<button class="card tight row" data-act="open-settings" style="width:100%;text-align:left">
+         <div class="grow"><h3>Sign in with Google</h3><div class="muted sm">Sync your log across iPhone, Safari and other devices.</div></div><span class="muted">›</span></button>` : '';
   return `
+    <div class="appbar"><span class="brand">FitLog</span>${gearBtn()}</div>
     <header class="top">
       <button class="icon-btn plain" data-act="prev-day" aria-label="Previous day">‹</button>
       <label class="date-pick"><span class="date-label">${dateLabel(d)}</span>
@@ -192,7 +248,7 @@ function viewToday() {
         <input type="date" data-change="pick-date" value="${d}" max="${C.today()}"></label>
       <button class="icon-btn plain" data-act="next-day" ${isToday ? 'disabled' : ''} aria-label="Next day">›</button>
     </header>
-    ${setup}${keyHint}
+    ${signHint}${setup}${keyHint}
     <section class="card">
       <div class="summary">
         <div class="ring-wrap">${ring({ value: tot.kcal, max: budget, over: left < 0 })}
@@ -239,49 +295,54 @@ function reviewCard(r, stale) {
 // ===== Activity =====
 function viewActivity() {
   const t = targets(), today = C.today(), ws = C.weekStart(today);
-  const thisWeek = S.workouts.filter((w) => w.date >= ws && w.date <= today);
-  const weekKcal = thisWeek.reduce((s, w) => s + (+w.kcal || 0), 0);
-  const weekDays = new Set(thisWeek.map((w) => w.date));
-
-  // 16-week heatmap, Monday rows on top
-  const WEEKS = 16, start = C.addDays(ws, -7 * (WEEKS - 1));
+  const wk = weekStats(ws);
   const mins = {};
   for (const w of S.workouts) mins[w.date] = (mins[w.date] || 0) + (+w.minutes || 0);
-  let cells = '';
-  for (let i = 0; i < WEEKS * 7; i++) {
-    const d = C.addDays(start, i), m = mins[d] || 0;
-    const lvl = d > today ? 'future' : m >= 60 ? 'l3' : m >= 30 ? 'l2' : m > 0 ? 'l1' : '';
-    cells += `<i class="${lvl}${d === today ? ' today' : ''}" title="${d}"></i>`;
-  }
+  const mealDays = new Set(S.meals.map((m) => m.date));
+  const reviewedThisWeek = Array.from({ length: 7 }, (_, i) => C.addDays(ws, i)).filter(isReviewed).length;
+  const activeAll = Object.keys(mins).length;
+  const week = Array.from({ length: 7 }, (_, i) => {
+    const d = C.addDays(ws, i);
+    return `<div class="wd${mins[d] ? ' on' : ''}${d === today ? ' now' : ''}${d > today ? ' future' : ''}"><i></i><span>${'MTWTFSS'[i]}</span></div>`;
+  }).join('');
+  const minPct = Math.min(100, (wk.minutes / (t.weeklyMinutes || 1)) * 100);
 
   const recent = [...S.workouts].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0))).slice(0, 30);
-  const dots = Array.from({ length: Math.max(t.workoutsPerWeek, thisWeek.length) }, (_, i) => `<i class="${i < thisWeek.length ? 'on' : ''}"></i>`).join('');
 
   return `
-    <header class="row between"><h1>Activity</h1><button class="btn primary sm" data-act="add-workout" data-today="1">+ Log workout</button></header>
+    <header class="row between"><h1>Activity</h1><div class="row"><button class="btn primary sm" data-act="add-workout" data-today="1">+ Log workout</button>${gearBtn()}</div></header>
     <section class="card">
-      <div class="card-title"><span class="label">This week</span><span class="sm muted num">${thisWeek.length} / ${t.workoutsPerWeek} sessions</span></div>
-      <div class="week-dots">${dots}</div>
-      <div class="row between sm muted" style="margin-top:10px"><span>${weekDays.size} active day${weekDays.size === 1 ? '' : 's'}</span><span class="num" style="color:var(--burn)">${fmt(weekKcal)} kcal burned</span></div>
+      <div class="card-title"><span class="label">This week</span>${weekMet(ws) ? '<span class="pill ok">Goal met</span>' : ''}</div>
+      <div class="row between sm"><span>Active days</span><b class="num">${wk.days} / ${t.activeDays}</b></div>
+      <div class="week-days">${week}</div>
+      <div class="row between sm" style="margin-top:14px"><span>Minutes</span><b class="num">${fmt(wk.minutes)} / ${fmt(t.weeklyMinutes)}</b></div>
+      <div class="progress-bar" style="margin-top:6px"><i style="width:${minPct}%"></i></div>
+      <div class="row between xs muted" style="margin-top:8px"><span>${fmt(wk.kcal)} kcal burned</span><span>${reviewedThisWeek}/7 food days reviewed</span></div>
     </section>
     <div class="big-stats">
       <div class="card"><b>${workoutWeekStreak()}</b><span class="muted xs">week streak<br>(goal met)</span></div>
-      <div class="card"><b>${logStreak()}</b><span class="muted xs">day food-<br>log streak</span></div>
-      <div class="card"><b>${S.workouts.length}</b><span class="muted xs">total<br>workouts</span></div>
+      <div class="card"><b style="color:var(--carbs)">${logStreak()}</b><span class="muted xs">day food-<br>log streak</span></div>
+      <div class="card"><b>${activeAll}</b><span class="muted xs">total<br>active days</span></div>
     </div>
     <section class="card">
-      <div class="card-title"><span class="label">Last 16 weeks</span><span class="xs faint">Mon → Sun ↓</span></div>
-      <div class="heat">${cells}</div>
+      <div class="card-title"><span class="label">Workouts · 16 weeks</span><span class="xs faint">Mon → Sun ↓</span></div>
+      ${heatGrid((d) => { const m = mins[d] || 0; return m >= 60 ? 'l3' : m >= 30 ? 'l2' : m > 0 ? 'l1' : ''; })}
       <div class="legend"><span><i class="dot-i" style="background:var(--surface-2)"></i>rest</span><span><i class="dot-i" style="background:rgba(74,222,128,.35)"></i>&lt;30 min</span>
         <span><i class="dot-i" style="background:rgba(74,222,128,.65)"></i>30–59</span><span><i class="dot-i" style="background:var(--accent)"></i>60+</span></div>
     </section>
     <section class="card">
-      <div class="card-title"><span class="label">Recent</span></div>
+      <div class="card-title"><span class="label">Food log · 16 weeks</span><span class="xs faint">Mon → Sun ↓</span></div>
+      ${heatGrid((d) => (isReviewed(d) ? 'food' : mealDays.has(d) ? 'food-part' : ''))}
+      <div class="legend"><span><i class="dot-i" style="background:var(--surface-2)"></i>no log</span>
+        <span><i class="dot-i" style="background:rgba(251,191,36,.28)"></i>logged, not reviewed</span><span><i class="dot-i" style="background:var(--carbs)"></i>complete (reviewed)</span></div>
+    </section>
+    <section class="card">
+      <div class="card-title"><span class="label">Recent workouts</span></div>
       ${recent.length ? recent.map((w) => `<button class="list-row" data-act="edit-workout" data-id="${w.id}">
           <div class="badge">${n0(w.minutes)}′</div>
           <div class="grow"><div style="font-weight:600">${esc(w.name)}</div><div class="muted xs">${dateLabel(w.date)} · ${esc(w.intensity || '')}</div></div>
           <div class="num" style="color:var(--burn);font-weight:700">${fmt(w.kcal)}</div></button>`).join('')
-        : '<div class="empty-hint">No workouts yet. Log your first session to start the streak.</div>'}
+        : '<div class="empty-hint">No workouts yet. Log your first one to start the streak.</div>'}
     </section>`;
 }
 
@@ -293,7 +354,7 @@ function viewProgress() {
 
   // goal progress
   let goalCard = `<section class="card"><div class="label">Goal</div><p class="muted sm" style="margin:6px 0 10px">Set your current and goal weight in Settings to see a forecast.</p>
-    <button class="btn sm" data-act="tab" data-tab="settings">Open settings</button></section>`;
+    <button class="btn sm" data-act="open-settings">Open settings</button></section>`;
   if (cur && goal) {
     const total = Math.abs(startW - goal) || 1;
     const done = Math.max(0, Math.min(1, (Math.abs(startW - goal) - Math.abs(cur - goal)) / total));
@@ -338,7 +399,7 @@ function viewProgress() {
   const reviewed = Object.entries(S.days).filter(([, v]) => v.closed && v.review).sort((a, b) => (a[0] < b[0] ? 1 : -1)).slice(0, 10);
 
   return `
-    <header class="row between"><h1>Progress</h1><button class="btn primary sm" data-act="weigh-in">+ Weigh-in</button></header>
+    <header class="row between"><h1>Progress</h1><div class="row"><button class="btn primary sm" data-act="weigh-in">+ Weigh-in</button>${gearBtn()}</div></header>
     ${goalCard}
     <section class="card">
       <div class="card-title"><span class="label">Weight</span><span class="sm muted">${cur ? n1(cur) + ' kg' : ''}</span></div>
@@ -404,7 +465,8 @@ function viewSettings() {
   const models = [...new Set([st.model, ...(st.models || [])].filter(Boolean))];
 
   return `
-    <header><h1>Settings</h1></header>
+    <header class="row"><button class="icon-btn plain" data-act="close-settings" aria-label="Back">‹</button><h1>Settings</h1></header>
+    ${accountCard()}
 
     <section class="card stack">
       <div class="label">Profile</div>
@@ -442,17 +504,32 @@ function viewSettings() {
         <label class="field"><span>Carbs (g)</span>${num('goals.carbs', g.carbs, 'g', '1')}</label>
         <label class="field"><span>Fat (g)</span>${num('goals.fat', g.fat, 'g', '1')}</label></div>` : ''}
       <div class="grid2" style="margin-top:12px">
-        <label class="field"><span>Workouts / week</span>${num('goals.workoutsPerWeek', g.workoutsPerWeek, '4', '1')}</label>
-        <label class="field"><span>Eat back exercise</span><select data-path="goals.eatBack" data-num>
-          ${[0, 50, 100].map((v) => `<option value="${v}" ${+g.eatBack === v ? 'selected' : ''}>${v}%</option>`).join('')}</select></label>
+        <label class="field"><span>Active days / week</span>${num('goals.activeDays', g.activeDays, '4', '1')}</label>
+        <label class="field"><span>Workout minutes / week</span>${num('goals.weeklyMinutes', g.weeklyMinutes, '150', '10')}</label>
       </div>
+      <p class="muted xs" style="margin:8px 0 0">WHO recommends at least 150 min/week of moderate activity (or 75 min vigorous), plus strength training on 2+ days.</p>
+      <label class="field" style="margin-top:12px"><span>Eat back exercise</span><select data-path="goals.eatBack" data-num>
+        ${[0, 50, 100].map((v) => `<option value="${v}" ${+g.eatBack === v ? 'selected' : ''}>${v}%</option>`).join('')}</select></label>
       <p class="muted xs" style="margin:8px 0 0">"Eat back" adds that share of workout calories to the day's budget. 0–50% is safest, because trackers tend to overestimate burn.</p>
     </section>
 
     <section class="card stack">
-      <div class="label">AI (Google Gemini, free)</div>
+      <div class="label">AI provider</div>
+      <div class="seg">
+        <button data-act="set-provider" data-v="gemini" class="${st.provider !== 'claude' ? 'on' : ''}">Gemini · free</button>
+        <button data-act="set-provider" data-v="claude" class="${st.provider === 'claude' ? 'on' : ''}">Claude · paid</button>
+      </div>
+      <p class="muted xs" style="margin:0">${st.provider === 'claude'
+        ? 'Claude is billed per use to your Anthropic account and is usually faster and more reliable than Gemini’s free tier.'
+        : 'Gemini’s free tier has daily limits and can be slow or busy at peak times.'} Keys ${ui.user ? 'sync with your account and' : 'stay on this device and'} are sent only to Google or Anthropic.</p>
+      <div class="row between"><div><div style="font-weight:600">Use the other one as backup</div><div class="muted xs">If the chosen AI is busy or out of quota</div></div>
+        <label class="switch"><input type="checkbox" data-path="settings.autoFallback" ${st.autoFallback !== false ? 'checked' : ''}><i></i></label></div>
+    </section>
+
+    <section class="card stack">
+      <div class="label">Gemini (Google, free)</div>
       <label class="field"><span>API key</span><input type="password" autocomplete="off" data-path="settings.apiKey" value="${esc(st.apiKey)}" placeholder="Paste key from Google AI Studio"></label>
-      <p class="muted xs" style="margin:0">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" style="color:var(--accent)">aistudio.google.com/apikey</a>. It stays on this device and is sent only to Google.</p>
+      <p class="muted xs" style="margin:0">Free key: <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" style="color:var(--accent)">aistudio.google.com/apikey</a></p>
       <div class="row">
         <label class="field grow"><span>Model</span><select data-path="settings.model">
           ${models.length ? models.map((m) => `<option ${m === st.model ? 'selected' : ''}>${esc(m)}</option>`).join('') : '<option value="">Auto (detect on first use)</option>'}</select></label>
@@ -461,14 +538,49 @@ function viewSettings() {
     </section>
 
     <section class="card stack">
+      <div class="label">Claude (Anthropic, paid)</div>
+      <label class="field"><span>API key</span><input type="password" autocomplete="off" data-path="settings.claudeKey" value="${esc(st.claudeKey)}" placeholder="sk-ant-…"></label>
+      <p class="muted xs" style="margin:0">Create a key and add credit at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style="color:var(--accent)">console.anthropic.com</a>. Set a monthly spend limit there for peace of mind.</p>
+      <div class="row">
+        <label class="field grow"><span>Model</span><select data-path="settings.claudeModel">
+          ${AI.CLAUDE_MODELS.map((m) => `<option value="${m.id}" ${m.id === (st.claudeModel || AI.DEFAULT_CLAUDE_MODEL) ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select></label>
+        <button class="btn" style="align-self:flex-end" data-act="test-claude" ${st.claudeKey ? '' : 'disabled'}>Test</button>
+      </div>
+    </section>
+
+    <section class="card stack">
       <div class="label">Data</div>
-      <p class="muted xs" style="margin:0">Everything is stored on this device only. Add FitLog to your Home Screen so iOS keeps it, and export a backup now and then.</p>
+      <p class="muted xs" style="margin:0">${ui.user ? 'Synced to your Google account. A backup file is still handy as an extra copy.' : 'Everything is stored on this device only. Add FitLog to your Home Screen so iOS keeps it, and export a backup now and then.'}</p>
       <div class="grid2"><button class="btn" data-act="export">Export backup</button>
         <label class="btn">Import backup<input type="file" accept="application/json,.json" data-change="import" hidden></label></div>
       <button class="btn block" data-act="prune-photos">Delete photos older than 60 days</button>
-      <button class="btn danger block" data-act="reset">Erase all data</button>
+      <button class="btn danger block" data-act="reset">${ui.user ? 'Erase all account data' : 'Erase all data'}</button>
     </section>
     <p class="center faint xs">FitLog · estimates are approximate and not medical advice.</p>`;
+}
+
+function accountCard() {
+  if (!cloud.enabled) return '';
+  if (!ui.user) {
+    return `<section class="card stack">
+      <div class="label">Account</div>
+      <p class="muted sm" style="margin:0">Sign in to save your log to your Google account and use it on any device. Without signing in, data stays on this device only.</p>
+      <button class="btn primary block" data-act="sign-in">
+        <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#052e14" d="M44.5 20H24v8.5h11.8C34.7 33.9 30.1 37 24 37c-7.2 0-13-5.8-13-13s5.8-13 13-13c3.1 0 5.9 1.1 8.1 2.9l6.4-6.4C34.6 4.1 29.6 2 24 2 11.8 2 2 11.8 2 24s9.8 22 22 22c11 0 21-8 21-22 0-1.3-.2-2.7-.5-4z"/></svg>
+        Sign in with Google</button>
+    </section>`;
+  }
+  const u = ui.user;
+  return `<section class="card">
+    <div class="label" style="margin-bottom:10px">Account</div>
+    <div class="row">
+      ${u.photoURL ? `<img src="${esc(u.photoURL)}" alt="" referrerpolicy="no-referrer" style="width:40px;height:40px;border-radius:50%">` : ''}
+      <div class="grow"><div style="font-weight:600">${esc(u.displayName || 'Signed in')}</div><div class="muted xs">${esc(u.email || '')}</div></div>
+      <span class="pill ok">Synced</span>
+    </div>
+    <p class="muted xs" style="margin:10px 0">Your log and API key are stored in your private Firebase database and sync to every device you sign in on. Works offline; changes upload when you reconnect.</p>
+    <button class="btn block" data-act="sign-out">Sign out</button>
+  </section>`;
 }
 
 // ---------- meal sheet ----------
@@ -495,6 +607,44 @@ const cleanItem = (i) => ({
   fiber: n1(i.fiber), sugar: n1(i.sugar), sodium: n0(i.sodium),
 });
 
+// ---------- personal food database (built from every item ever logged) ----------
+const normName = (x) => String(x || '').toLowerCase().replace(/\s+/g, ' ').trim();
+function foodIndex(excludeMealId) {
+  const meals = S.meals.filter((m) => m.id !== excludeMealId)
+    .sort((a, b) => (a.date === b.date ? (a.createdAt || 0) - (b.createdAt || 0) : a.date < b.date ? -1 : 1));
+  const foods = new Map();
+  for (const m of meals) {
+    for (const it of m.items) {
+      const key = normName(it.name);
+      if (!key) continue;
+      const f = foods.get(key) || { count: 0 };
+      foods.set(key, { item: it, count: f.count + 1, last: m.date }); // latest version wins
+    }
+  }
+  return { foods: [...foods.values()], meals: meals.reverse() };
+}
+function searchFoods(index, q) {
+  const toks = normName(q).split(' ').filter(Boolean);
+  if (!toks.length) return [...index.foods].sort((a, b) => b.count - a.count || (a.last < b.last ? 1 : -1)).slice(0, 8);
+  return index.foods
+    .filter((f) => { const hay = normName(f.item.name + ' ' + f.item.portion); return toks.every((t) => hay.includes(t)); })
+    .sort((a, b) => (normName(b.item.name).startsWith(toks[0]) - normName(a.item.name).startsWith(toks[0])) || b.count - a.count)
+    .slice(0, 8);
+}
+function recentMeals(index, type, q) {
+  const toks = normName(q).split(' ').filter(Boolean), seen = new Set(), out = [];
+  for (const m of index.meals) {
+    if (toks.length ? m.items.length < 2 : m.type !== type) continue; // single items already show as foods
+    const label = m.items.map((i) => i.name).join(', ');
+    const key = normName(label);
+    if (!key || seen.has(key) || !toks.every((t) => key.includes(t))) continue;
+    seen.add(key);
+    out.push({ meal: m, label });
+    if (out.length === 3) break;
+  }
+  return out;
+}
+
 async function openMealSheet({ id, type }) {
   const existing = id && S.meals.find((m) => m.id === id);
   const draft = existing ? clone(existing) : {
@@ -503,8 +653,27 @@ async function openMealSheet({ id, type }) {
   };
   const photos = new Map(); // id -> dataURL
   for (const pid of draft.photoIds) photos.set(pid, await getPhoto(pid));
-  let busy = false, refineText = '';
+  let busy = false, refineText = '', query = '';
+  const index = foodIndex(draft.id);
   const el = openSheet({ persistent: true });
+
+  const suggestionsHtml = () => {
+    if (!index.foods.length) return '';
+    const foods = searchFoods(index, query);
+    const meals = recentMeals(index, draft.type, query);
+    if (!foods.length && !meals.length) return `<div class="empty-hint">No match in your foods. Use a photo or notes with AI below.</div>`;
+    const typeLabel = C.MEAL_TYPES.find((x) => x.key === draft.type).label.toLowerCase();
+    return `
+      ${meals.length ? `<div class="label xs" style="margin:2px 0 6px">${query ? 'Past meals' : `Repeat a recent ${typeLabel}`}</div>
+        ${meals.map((x, i) => `<button class="sugg-row" data-m="use-meal" data-i="${i}"><div class="grow"><div class="entry-title">${esc(x.label)}</div>
+          <div class="muted xs">${dateLabel(x.meal.date)} · ${x.meal.items.length} item${x.meal.items.length === 1 ? '' : 's'}</div></div>
+          <b class="num">${fmt(C.sumItems(x.meal.items).kcal)}</b><span class="plus">+</span></button>`).join('')}` : ''}
+      ${foods.length ? `<div class="label xs" style="margin:10px 0 6px">${query ? 'Your foods' : 'Frequent foods'}</div>
+        ${foods.map((f, i) => `<button class="sugg-row" data-m="use-food" data-i="${i}"><div class="grow"><div class="entry-title">${esc(f.item.name)}</div>
+          <div class="muted xs">${esc(f.item.portion || '')}${f.count > 1 ? ` · logged ${f.count}×` : ''}</div></div>
+          <b class="num">${fmt(f.item.kcal)}</b><span class="plus">+</span></button>`).join('')}` : ''}`;
+  };
+  const paintSuggestions = () => { const box = $('#m-sugg', el); if (box) box.innerHTML = suggestionsHtml(); };
 
   const paint = () => {
     const t = C.sumItems(draft.items);
@@ -514,6 +683,8 @@ async function openMealSheet({ id, type }) {
         <button class="link strong" data-m="save" ${busy ? 'disabled' : ''}>Save</button></div>
       <div class="sheet-body">
         <div class="seg">${C.MEAL_TYPES.map((m) => `<button data-m="type" data-v="${m.key}" class="${draft.type === m.key ? 'on' : ''}">${m.label}</button>`).join('')}</div>
+        ${index.foods.length ? `<input type="search" data-f="search" value="${esc(query)}" placeholder="Search foods you've logged before (no AI)" autocomplete="off">
+          <div id="m-sugg">${draft.items.length && !query ? '' : suggestionsHtml()}</div>` : ''}
         <div class="photo-grid">
           ${[...photos].map(([pid, src]) => `<div class="photo"><img src="${src}" alt=""><button class="x" data-m="rm-photo" data-id="${pid}" aria-label="Remove">×</button></div>`).join('')}
           <label class="photo-add"><b>+</b>Photo<input type="file" accept="image/*" multiple hidden data-m-file></label>
@@ -540,7 +711,8 @@ async function openMealSheet({ id, type }) {
     return `<div class="item">
       <div class="row"><input class="name grow" data-i="${i}" data-k="name" value="${esc(it.name)}" placeholder="Food name">
         <button class="icon-btn plain" data-m="del-item" data-i="${i}" aria-label="Remove item">×</button></div>
-      <input data-i="${i}" data-k="portion" value="${esc(it.portion)}" placeholder="Portion, e.g. 1 bowl (200 g)">
+      <div class="row"><input class="grow" data-i="${i}" data-k="portion" value="${esc(it.portion)}" placeholder="Portion, e.g. 1 bowl (200 g)">
+        <div class="scale">${[0.5, 1.5, 2].map((f) => `<button data-m="scale" data-i="${i}" data-x="${f}">${f === 0.5 ? '½' : f}×</button>`).join('')}</div></div>
       <div class="nums">${f('kcal', 'kcal')}${f('protein', 'Protein')}${f('carbs', 'Carbs')}${f('fat', 'Fat')}</div>
       <details><summary>Fiber · sugar · sodium ›</summary><div class="nums">${f('fiber', 'Fiber g')}${f('sugar', 'Sugar g')}${f('sodium', 'Sodium mg')}</div></details>
     </div>`;
@@ -561,6 +733,7 @@ async function openMealSheet({ id, type }) {
     const tg = e.target;
     if (tg.dataset.f === 'note') { draft.note = tg.value; const b = $('[data-m="analyze"]', el); if (b && !busy) b.disabled = !(photos.size || draft.note.trim()); }
     else if (tg.dataset.f === 'refine') refineText = tg.value;
+    else if (tg.dataset.f === 'search') { query = tg.value; paintSuggestions(); }
     else if (tg.dataset.k) {
       const it = draft.items[+tg.dataset.i];
       it[tg.dataset.k] = ['name', 'portion'].includes(tg.dataset.k) ? tg.value : tg.value === '' ? 0 : +tg.value;
@@ -588,11 +761,26 @@ async function openMealSheet({ id, type }) {
     else if (m === 'rm-photo') { photos.delete(b.dataset.id); paint(); }
     else if (m === 'add-item') { draft.items.push(cleanItem({ name: '', kcal: 0 })); paint(); $$('.item .name', el).at(-1)?.focus(); }
     else if (m === 'del-item') { draft.items.splice(+b.dataset.i, 1); paint(); }
+    else if (m === 'use-food' || m === 'use-meal') {
+      const picked = m === 'use-food'
+        ? [searchFoods(index, query)[+b.dataset.i].item]
+        : recentMeals(index, draft.type, query)[+b.dataset.i].meal.items;
+      draft.items.push(...picked.map((it) => cleanItem(clone(it))));
+      query = '';
+      paint();
+      toast(`Added ${picked.length > 1 ? picked.length + ' items' : picked[0].name} from your foods`);
+    } else if (m === 'scale') {
+      const it = draft.items[+b.dataset.i], x = +b.dataset.x;
+      for (const k of C.NUTRIENTS) it[k] = k === 'kcal' || k === 'sodium' ? n0(it[k] * x) : n1(it[k] * x);
+      it.portion = `${x === 0.5 ? '½' : x}× ${it.portion}`.trim();
+      paint();
+    }
     else if (m === 'analyze') {
       busy = 'analyze'; paint();
       try {
         const label = C.MEAL_TYPES.find((x) => x.key === draft.type).label;
         applyResult(await AI.analyzeMeal({ images: [...photos.values()], mealType: label, note: draft.note }));
+        if (AI.lastProvider()?.includes('backup')) toast(`Used ${AI.lastProvider()}`);
       } catch (err) { toast(err.message); }
       busy = false; paint();
     } else if (m === 'refine') {
@@ -605,15 +793,15 @@ async function openMealSheet({ id, type }) {
       busy = false; paint();
     } else if (m === 'delete') {
       if (!confirm('Delete this meal?')) return;
-      for (const pid of draft.photoIds) { db.photoDel(pid); photoCache.delete(pid); }
+      draft.photoIds.forEach(deletePhoto);
       S.meals = S.meals.filter((x) => x.id !== draft.id);
       markDirty(draft.date); save(); closeSheet(); render();
     } else if (m === 'save') {
       draft.items = draft.items.filter((i) => i.name.trim() || +i.kcal);
       if (!draft.items.length) return toast('Analyze with AI or add at least one item');
       const keep = new Set(photos.keys());
-      for (const pid of draft.photoIds) if (!keep.has(pid)) { db.photoDel(pid); photoCache.delete(pid); }
-      for (const [pid, src] of photos) if (!draft.photoIds.includes(pid)) { await db.photoSet(pid, src); photoCache.set(pid, src); }
+      for (const pid of draft.photoIds) if (!keep.has(pid)) deletePhoto(pid);
+      for (const [pid, src] of photos) if (!draft.photoIds.includes(pid)) await savePhoto(pid, src);
       draft.photoIds = [...keep];
       draft.items = draft.items.map(cleanItem);
       const idx = S.meals.findIndex((x) => x.id === draft.id);
@@ -753,13 +941,13 @@ function reviewContext(d) {
   return {
     date: d,
     profile: { sex: S.profile.sex, age: S.profile.age, heightCm: S.profile.heightCm, weightKg: curWeight(), goalWeightKg: S.profile.goalWeightKg, paceKgPerWeek: S.profile.rate },
-    targets: { kcal: t.kcal, protein: t.protein, carbs: t.carbs, fat: t.fat, workoutsPerWeek: t.workoutsPerWeek, maintenanceKcal: t.calc?.tdee ?? null },
+    targets: { kcal: t.kcal, protein: t.protein, carbs: t.carbs, fat: t.fat, activeDaysPerWeek: t.activeDays, workoutMinutesPerWeek: t.weeklyMinutes, maintenanceKcal: t.calc?.tdee ?? null },
     intake: { kcal: n0(tot.kcal), protein: n0(tot.protein), carbs: n0(tot.carbs), fat: n0(tot.fat), fiber: n0(tot.fiber), sugar: n0(tot.sugar), sodiumMg: n0(tot.sodium) },
     exerciseKcal: n0(tot.burn),
     meals: mealsOn(d).map((m) => ({ meal: m.type, kcal: n0(C.sumItems(m.items).kcal), items: m.items.map((i) => `${i.name} (${i.portion}) ${n0(i.kcal)} kcal`), note: m.note || undefined })),
     workouts: workoutsOn(d).map((w) => `${w.name}, ${w.minutes} min, ${w.intensity}, ~${w.kcal} kcal`),
     previous7Days: { loggedDays: prev.length, avgKcal: prev.length ? n0(prev.reduce((s, x) => s + x.kcal, 0) / prev.length) : null },
-    workoutsThisWeek: weekCount(ws),
+    thisWeekSoFar: (({ days, minutes }) => ({ activeDays: days, workoutMinutes: minutes }))(weekStats(ws)),
   };
 }
 
@@ -817,6 +1005,13 @@ document.addEventListener('click', async (e) => {
   if (!b || b.disabled) return;
   switch (b.dataset.act) {
     case 'tab': ui.tab = b.dataset.tab; render(); window.scrollTo(0, 0); break;
+    case 'open-settings': if (ui.tab !== 'settings') ui.prevTab = ui.tab; ui.tab = 'settings'; render(); window.scrollTo(0, 0); break;
+    case 'close-settings': ui.tab = ui.prevTab || 'today'; render(); window.scrollTo(0, 0); break;
+    case 'set-provider': S.settings.provider = b.dataset.v; save(); render(); break;
+    case 'test-claude':
+      b.innerHTML = spinner; b.disabled = true;
+      try { await AI.testClaude(S.settings.claudeKey, S.settings.claudeModel); toast('Claude key works'); } catch (err) { toast(err.message); }
+      render(); break;
     case 'prev-day': ui.date = C.addDays(ui.date, -1); ui.followToday = false; render(); break;
     case 'next-day': ui.date = C.addDays(ui.date, 1); ui.followToday = ui.date >= C.today(); render(); break;
     case 'goto-day': ui.date = b.dataset.date; ui.followToday = ui.date === C.today(); ui.tab = 'today'; render(); window.scrollTo(0, 0); break;
@@ -839,7 +1034,22 @@ document.addEventListener('click', async (e) => {
     }
     case 'export': exportData(); break;
     case 'prune-photos': prunePhotos(); break;
+    case 'sign-in':
+      b.disabled = true;
+      try { await cloud.signIn(); } catch (err) { toast(err.message); b.disabled = false; }
+      break;
+    case 'sign-out':
+      if (!confirm('Sign out? Your data stays in your Google account.')) return;
+      await cloud.signOut();
+      break;
     case 'reset':
+      if (ui.user) {
+        if (!confirm('Erase ALL meals, workouts, weights and settings in your account, on every device?')) return;
+        b.disabled = true;
+        try { await cloud.eraseAll(); } catch (err) { return toast('Erase failed: ' + err.message); }
+        await db.clearAll(); photoCache.clear(); toast('All account data erased');
+        break;
+      }
       if (!confirm('Erase ALL meals, workouts, weights and settings on this device?')) return;
       await db.clearAll(); photoCache.clear(); S = hydrateState(null); await flush(); render(); toast('All data erased');
       break;
@@ -869,7 +1079,11 @@ document.addEventListener('change', async (e) => {
 // ---------- data management ----------
 async function exportData() {
   await flush();
-  const data = { ...clone(S), settings: { ...S.settings, apiKey: '' }, exportedAt: new Date().toISOString() };
+  let full = clone(S);
+  if (ui.user) {
+    try { full = hydrateState(await cloud.fetchAll()); } catch { toast('Offline: exporting loaded data only'); }
+  }
+  const data = { ...full, settings: { ...full.settings, apiKey: '', claudeKey: '', models: [] }, exportedAt: new Date().toISOString() };
   const file = new File([JSON.stringify(data, null, 1)], `fitlog-backup-${C.today()}.json`, { type: 'application/json' });
   if (navigator.canShare?.({ files: [file] })) {
     try { await navigator.share({ files: [file], title: 'FitLog backup' }); return; } catch (err) { if (err.name === 'AbortError') return; }
@@ -886,10 +1100,11 @@ async function importData(file) {
     const data = JSON.parse(await file.text());
     if (!Array.isArray(data.meals) || !data.profile) throw new Error('Not a FitLog backup');
     if (!confirm(`Replace current data with backup (${data.meals.length} meals, ${data.workouts?.length || 0} workouts)? Photos are not included in backups.`)) return;
-    const key = S.settings.apiKey;
+    const { apiKey, claudeKey } = S.settings;
     S = hydrateState(data);
     delete S.exportedAt;
-    if (!S.settings.apiKey) S.settings.apiKey = key;
+    S.settings.apiKey ||= apiKey;
+    S.settings.claudeKey ||= claudeKey;
     await flush(); render(); toast('Backup restored');
   } catch (err) { toast('Import failed: ' + err.message); }
 }
@@ -899,18 +1114,67 @@ async function prunePhotos() {
   let n = 0;
   for (const m of S.meals) {
     if (m.date < cutoff && m.photoIds?.length) {
-      for (const pid of m.photoIds) { await db.photoDel(pid); photoCache.delete(pid); n++; }
+      for (const pid of m.photoIds) { deletePhoto(pid); n++; }
       m.photoIds = [];
     }
   }
   save(); toast(`Deleted ${n} photo${n === 1 ? '' : 's'}`);
 }
 
+// ---------- account / sync ----------
+async function loadLocal() {
+  try { return hydrateState(await db.kvGet('state')); } catch (err) { toast('Storage unavailable: ' + err.message); return hydrateState(null); }
+}
+const hasData = (s) => s.meals.length || s.workouts.length || s.weights.length || s.profile.age;
+
+function applyCloud(data) {
+  const models = S?.settings?.models || [];
+  const s = hydrateState({ ...(data.root || {}), meals: data.meals, workouts: data.workouts, weights: data.weights, days: data.days });
+  s.settings.models = models;
+  return s;
+}
+
+async function onUser(u) {
+  ui.user = u;
+  if (!u) { S = await loadLocal(); render(); return; }
+  ui.syncing = true;
+  render();
+  const { data, empty } = await cloud.start();
+  if (ui.user !== u) return; // signed out meanwhile
+  S = applyCloud(data);
+  if (empty) {
+    const local = await loadLocal();
+    if (hasData(local) && confirm('Copy the meals, workouts and weights on this device into your Google account?')) {
+      S = local;
+      uploadLocalPhotos(local);
+    } else {
+      for (const k of ['apiKey', 'model', 'claudeKey', 'claudeModel', 'provider']) S.settings[k] ||= local.settings[k];
+    }
+    cloud.push(S);
+  }
+  ui.syncing = false;
+  render();
+}
+
+async function uploadLocalPhotos(s) {
+  const ids = s.meals.flatMap((m) => m.photoIds || []);
+  for (const id of ids) {
+    const src = await db.photoGet(id).catch(() => null);
+    if (src) cloud.photoSet(id, src);
+  }
+  if (ids.length) toast(`Uploading ${ids.length} photo${ids.length === 1 ? '' : 's'}`);
+}
+
 // ---------- boot ----------
 async function boot() {
-  try { S = hydrateState(await db.kvGet('state')); } catch (err) { S = hydrateState(null); toast('Storage unavailable: ' + err.message); }
+  S = await loadLocal();
   AI.configure(() => S.settings, (m) => { S.settings.model = m; save(); });
   render();
+  cloud.init({
+    onUser,
+    onData: (data) => { S = applyCloud(data); render(); },
+    onError: (msg) => toast(msg),
+  });
   navigator.storage?.persist?.();
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
 }

@@ -52,7 +52,7 @@ h3 { font-size: 15px; font-weight: 600; }
 /* ---------- tabs ---------- */
 #tabs {
   position: fixed; inset: auto 0 0 0; z-index: 20;
-  display: grid; grid-template-columns: repeat(4, 1fr);
+  display: grid; grid-template-columns: repeat(3, 1fr);
   padding: 6px 8px calc(6px + var(--safe-b));
   background: rgba(10, 11, 13, 0.82);
   backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
@@ -217,6 +217,8 @@ input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-app
 .heat i.l1 { background: rgba(74, 222, 128, 0.35); }
 .heat i.l2 { background: rgba(74, 222, 128, 0.65); }
 .heat i.l3 { background: var(--accent); }
+.heat i.food { background: var(--carbs); }
+.heat i.food-part { background: rgba(251, 191, 36, 0.28); }
 .heat i.today { outline: 1.5px solid var(--text); outline-offset: -1.5px; }
 .heat i.future { background: transparent; }
 .week-dots { display: flex; gap: 6px; }
@@ -255,3 +257,25 @@ input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-app
   opacity: 0; pointer-events: none; transition: 0.25s; z-index: 80; max-width: calc(100% - 32px); text-align: center;
 }
 #toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* ---------- app bar / settings gear ---------- */
+.appbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: -6px; }
+.brand { font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
+.icon-btn.gear { color: var(--muted); }
+
+/* ---------- this-week day strip ---------- */
+.week-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 8px; }
+.week-days .wd { display: grid; justify-items: center; gap: 4px; font-size: 11px; color: var(--faint); }
+.week-days .wd i { width: 100%; height: 10px; border-radius: 5px; background: var(--surface-2); }
+.week-days .wd.on i { background: var(--accent); }
+.week-days .wd.now span { color: var(--text); font-weight: 700; }
+.week-days .wd.future i { background: transparent; border: 1px dashed var(--line); }
+
+/* ---------- food database suggestions ---------- */
+input[type=search] { width: 100%; background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; font-size: 16px; outline: none; -webkit-appearance: none; appearance: none; }
+input[type=search]:focus { border-color: var(--accent); }
+#m-sugg:empty { display: none; }
+.sugg-row { width: 100%; display: flex; align-items: center; gap: 10px; text-align: left; background: var(--surface-2); border: 0; border-radius: 12px; padding: 9px 12px; margin-bottom: 6px; }
+.sugg-row .plus { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--accent-ink); font-weight: 700; flex-shrink: 0; }
+.scale { display: flex; gap: 4px; flex-shrink: 0; }
+.scale button { border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 6px 7px; font-size: 12px; font-weight: 600; color: var(--muted); }
