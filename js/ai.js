@@ -12,9 +12,22 @@ export const CLAUDE_MODELS = [
 ];
 export const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5';
 
+// Hard per-attempt limits so a stuck connection fails (and can fall back) instead of spinning forever.
+const TIMEOUT_MS = { images: 60_000, text: 35_000 };
+
 let getSettings = () => ({});
 let onModelPicked = () => {};
-export function configure(getter, modelCallback) { getSettings = getter; onModelPicked = modelCallback; }
+let onStatus = () => {};
+export function configure(getter, modelCallback, statusCallback = () => {}) {
+  getSettings = getter; onModelPicked = modelCallback; onStatus = statusCallback;
+}
+
+// Small per-device activity log (Settings → AI activity) to diagnose slow or failed calls.
+const LOG_KEY = 'fitlog-ai-log';
+export function getLog() { try { return JSON.parse(localStorage.getItem(LOG_KEY) || '[]'); } catch { return []; } }
+function logAttempt(entry) {
+  try { localStorage.setItem(LOG_KEY, JSON.stringify([entry, ...getLog()].slice(0, 20))); } catch { /* storage unavailable */ }
+}
 
 class AIError extends Error {
   constructor(message, { retryable = false } = {}) { super(message); this.retryable = retryable; }
@@ -22,7 +35,10 @@ class AIError extends Error {
 
 // ---------- Gemini ----------
 export async function listModels(apiKey) {
-  const r = await fetch(`${GEMINI}/models?pageSize=200`, { headers: { 'x-goog-api-key': apiKey } });
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15_000);
+  const r = await fetch(`${GEMINI}/models?pageSize=200`, { headers: { 'x-goog-api-key': apiKey }, signal: ctl.signal })
+    .finally(() => clearTimeout(timer));
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
   return (j.models || [])
@@ -74,24 +90,30 @@ function thinkingFor(model, effort) {
   return null;
 }
 
-async function geminiOnce(model, apiKey, body) {
-  let r;
+async function geminiOnce(model, apiKey, body, timeoutMs) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    r = await fetch(`${GEMINI}/models/${encodeURIComponent(model)}:generateContent`, {
+    const r = await fetch(`${GEMINI}/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(body),
+      signal: ctl.signal,
     });
+    const j = await r.json().catch(() => ({}));
+    return { r, j };
   } catch {
-    throw new AIError('Network error. Check your connection.', { retryable: true });
+    if (ctl.signal.aborted) throw new AIError(`Gemini didn't answer within ${timeoutMs / 1000} s.`, { retryable: true });
+    throw new AIError('Network error reaching Gemini.', { retryable: true });
+  } finally {
+    clearTimeout(timer);
   }
-  const j = await r.json().catch(() => ({}));
-  return { r, j };
 }
 
-async function callGemini({ images, text, system, schema, effort }) {
+async function callGemini({ images, text, system, schema, effort }, timeoutMs) {
   const { apiKey } = getSettings();
   const model = await ensureGeminiModel(apiKey);
+  callGemini.model = model;
   const parts = images.map((d) => ({ inlineData: { mimeType: 'image/jpeg', data: d.split(',')[1] } }));
   parts.push({ text });
   const body = {
@@ -102,14 +124,14 @@ async function callGemini({ images, text, system, schema, effort }) {
   const thinking = thinkingFor(model, effort);
   if (thinking) body.generationConfig.thinkingConfig = thinking;
 
-  let { r, j } = await geminiOnce(model, apiKey, body);
+  let { r, j } = await geminiOnce(model, apiKey, body, timeoutMs);
   if (r.status === 400 && thinking && /thinking/i.test(j.error?.message || '')) {
     delete body.generationConfig.thinkingConfig; // model doesn't accept this thinking setting
-    ({ r, j } = await geminiOnce(model, apiKey, body));
+    ({ r, j } = await geminiOnce(model, apiKey, body, timeoutMs));
   }
   if (r.status === 503 || r.status === 500) { // "model overloaded": one quick retry
     await new Promise((res) => setTimeout(res, 1500));
-    ({ r, j } = await geminiOnce(model, apiKey, body));
+    ({ r, j } = await geminiOnce(model, apiKey, body, timeoutMs));
   }
   if (!r.ok) {
     if (r.status === 429) throw new AIError('Gemini free-tier limit reached.', { retryable: true });
@@ -126,11 +148,12 @@ async function callGemini({ images, text, system, schema, effort }) {
 let sdkPromise;
 const loadSdk = () => (sdkPromise ||= import(ANTHROPIC_SDK).then((m) => m.default).catch((e) => { sdkPromise = null; throw e; }));
 
-async function claudeClient(apiKey) {
+async function claudeClient(apiKey, timeoutMs = TIMEOUT_MS.text) {
   let Anthropic;
   try { Anthropic = await loadSdk(); } catch { throw new AIError('Could not load the Claude library (offline?).', { retryable: true }); }
   // The key is the user's own and stays on their device, so direct browser calls are acceptable here.
-  return { Anthropic, client: new Anthropic({ apiKey, dangerouslyAllowBrowser: true, maxRetries: 2 }) };
+  // timeout is in milliseconds in the TypeScript SDK; one automatic retry for 429/5xx/connection errors.
+  return { Anthropic, client: new Anthropic({ apiKey, dangerouslyAllowBrowser: true, timeout: timeoutMs, maxRetries: 1 }) };
 }
 
 function claudeError(Anthropic, e) {
@@ -139,15 +162,17 @@ function claudeError(Anthropic, e) {
   if (e instanceof Anthropic.NotFoundError) return new AIError('Claude model not available for this key.');
   if (e instanceof Anthropic.RateLimitError) return new AIError('Claude rate limit reached.', { retryable: true });
   if (e instanceof Anthropic.BadRequestError) return new AIError(`Claude rejected the request: ${e.message}`);
+  if (e instanceof Anthropic.APIConnectionTimeoutError) return new AIError("Claude didn't answer in time.", { retryable: true });
   if (e instanceof Anthropic.APIConnectionError) return new AIError('Network error reaching Claude.', { retryable: true });
   if (e instanceof Anthropic.APIError) return new AIError(`Claude error ${e.status ?? ''}: ${e.message}`, { retryable: (e.status ?? 500) >= 500 });
   return e;
 }
 
-async function callClaude({ images, text, system, schema, effort }) {
+async function callClaude({ images, text, system, schema, effort }, timeoutMs) {
   const { claudeKey, claudeModel } = getSettings();
   const model = claudeModel || DEFAULT_CLAUDE_MODEL;
-  const { Anthropic, client } = await claudeClient(claudeKey);
+  callClaude.model = model;
+  const { Anthropic, client } = await claudeClient(claudeKey, timeoutMs);
   const content = images.map((d) => ({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: d.split(',')[1] } }));
   content.push({ type: 'text', text });
   const params = {
@@ -190,13 +215,21 @@ async function generate(req) {
   const second = first === 'claude' ? 'gemini' : 'claude';
   const order = [first, second].filter((p) => PROVIDERS[p].ready(s));
   if (!order.length) throw new Error('Add a Gemini or Claude API key in Settings first.');
+  const timeoutMs = req.images.length ? TIMEOUT_MS.images : TIMEOUT_MS.text;
   let lastErr;
   for (const p of order) {
+    const started = Date.now();
+    const entry = { at: new Date().toISOString(), task: req.task, provider: PROVIDERS[p].name, images: req.images.length };
+    onStatus(PROVIDERS[p].name);
     try {
-      const text = await PROVIDERS[p].call(req);
+      const text = await PROVIDERS[p].call(req, timeoutMs);
+      let parsed;
+      try { parsed = JSON.parse(text); } catch { throw new AIError('Could not read the AI answer.', { retryable: true }); }
+      logAttempt({ ...entry, model: PROVIDERS[p].call.model, ms: Date.now() - started, ok: true });
       lastUsed = p === first ? PROVIDERS[p].name : `${PROVIDERS[p].name} (backup: ${lastErr?.message || 'first choice failed'})`;
-      try { return JSON.parse(text); } catch { throw new AIError('Could not read the AI answer.', { retryable: true }); }
+      return parsed;
     } catch (e) {
+      logAttempt({ ...entry, model: PROVIDERS[p].call.model, ms: Date.now() - started, ok: false, error: e.message });
       lastErr = e;
       if (!e.retryable || s.autoFallback === false) break;
     }
@@ -226,7 +259,7 @@ const MEAL_SYSTEM = `You are an experienced registered dietitian estimating nutr
 
 export function analyzeMeal({ images, mealType, note }) {
   const text = `Meal: ${mealType}.\nUser notes: ${note?.trim() || 'none'}\n${images.length ? '' : 'No photo: estimate from the description only.'}`;
-  return generate({ images, text, system: MEAL_SYSTEM, schema: MEAL, effort: 'medium' });
+  return generate({ task: 'meal', images, text, system: MEAL_SYSTEM, schema: MEAL, effort: 'medium' });
 }
 
 export function refineMeal({ items, note, correction }) {
@@ -234,7 +267,7 @@ export function refineMeal({ items, note, correction }) {
 Original user notes: ${note?.trim() || 'none'}
 User correction: ${correction}
 Apply the correction and return the full updated item list. Keep items the correction does not affect unchanged.`;
-  return generate({ images: [], text, system: MEAL_SYSTEM, schema: MEAL, effort: 'low' });
+  return generate({ task: 'adjust', images: [], text, system: MEAL_SYSTEM, schema: MEAL, effort: 'low' });
 }
 
 export function estimateWorkout({ text, profile }) {
@@ -242,7 +275,7 @@ export function estimateWorkout({ text, profile }) {
 Person: ${profile.sex}, ${profile.age} y, ${profile.heightCm} cm, ${profile.weightKg} kg.
 Return a short name, duration in minutes (assume a typical duration if not given), average MET,
 and NET active kcal burned above resting, i.e. (MET - 1) x kg x hours.`;
-  return generate({ images: [], text: prompt, system: 'You are an exercise physiologist. Be realistic and concise.', schema: WORKOUT, effort: 'low' });
+  return generate({ images: [], text: prompt, system: 'You are an exercise physiologist. Be realistic and concise.', schema: WORKOUT, effort: 'low', task: 'workout' });
 }
 
 export function dayReview(ctx) {
@@ -253,5 +286,5 @@ Be specific: reference the actual foods, numbers and workouts. Be honest but kin
 - summary: 2-3 sentences on intake vs target, macros, and burn.
 - wins: 1-3 short bullets. improvements: 1-3 short, practical, concrete suggestions (e.g. food swaps, timing, portion).
 - tomorrow: one actionable focus for tomorrow.`;
-  return generate({ images: [], text: `Day data (JSON):\n${JSON.stringify(ctx)}`, system, schema: REVIEW, effort: 'medium' });
+  return generate({ images: [], text: `Day data (JSON):\n${JSON.stringify(ctx)}`, system, schema: REVIEW, effort: 'medium', task: 'review' });
 }

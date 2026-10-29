@@ -176,6 +176,26 @@ function closeSheet() {
 }
 const spinner = '<span class="spinner"></span>';
 
+// Live "12 s · Gemini" readout on any element with data-ai-timer while an AI call runs.
+const aiRun = { provider: '', started: 0 };
+// While the AI works, keep the screen awake: if iOS auto-locks, the app is frozen and the answer is lost.
+let wakeLock = null;
+function startAiTimer() {
+  aiRun.started = Date.now(); aiRun.provider = '';
+  navigator.wakeLock?.request('screen').then((l) => { wakeLock = l; }).catch(() => {});
+}
+function stopAiTimer() {
+  aiRun.started = 0;
+  wakeLock?.release().catch(() => {});
+  wakeLock = null;
+}
+setInterval(() => {
+  if (!aiRun.started) return;
+  const secs = Math.round((Date.now() - aiRun.started) / 1000);
+  $$('[data-ai-timer]').forEach((el) => { el.textContent = `${secs} s${aiRun.provider ? ' · ' + aiRun.provider : ''}`; });
+}, 1000);
+const BG_HINT = '<p class="muted xs center" style="margin:6px 0 0">Keep FitLog open: iPhone pauses apps in the background, which can stall the request.</p>';
+
 // ---------- render ----------
 function render() {
   if (ui.followToday) ui.date = C.today();
@@ -548,6 +568,8 @@ function viewSettings() {
       </div>
     </section>
 
+    ${aiLogCard()}
+
     <section class="card stack">
       <div class="label">Data</div>
       <p class="muted xs" style="margin:0">${ui.user ? 'Synced to your Google account. A backup file is still handy as an extra copy.' : 'Everything is stored on this device only. Add FitLog to your Home Screen so iOS keeps it, and export a backup now and then.'}</p>
@@ -557,6 +579,20 @@ function viewSettings() {
       <button class="btn danger block" data-act="reset">${ui.user ? 'Erase all account data' : 'Erase all data'}</button>
     </section>
     <p class="center faint xs">FitLog · estimates are approximate and not medical advice.</p>`;
+}
+
+function aiLogCard() {
+  const log = AI.getLog();
+  if (!log.length) return '';
+  const when = (iso) => new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  return `<section class="card">
+    <div class="card-title"><span class="label">AI activity (this device)</span><span class="xs faint">last ${log.length}</span></div>
+    ${log.map((e) => `<div class="list-row" style="align-items:flex-start">
+      <span class="pill ${e.ok ? 'ok' : 'bad'}">${e.ok ? 'OK' : 'Fail'}</span>
+      <div class="grow"><div style="font-weight:600">${esc(e.task || 'request')} · ${esc(e.provider)}${e.model ? ` <span class="muted xs">${esc(e.model)}</span>` : ''}</div>
+        <div class="muted xs">${when(e.at)}${e.images ? ` · ${e.images} photo${e.images > 1 ? 's' : ''}` : ''}${e.error ? ` · ${esc(e.error)}` : ''}</div></div>
+      <b class="num sm">${(e.ms / 1000).toFixed(1)} s</b></div>`).join('')}
+  </section>`;
 }
 
 function accountCard() {
@@ -691,7 +727,8 @@ async function openMealSheet({ id, type }) {
         </div>
         <textarea data-f="note" placeholder="Optional notes: what it is, how much you ate, e.g. 'beef noodle soup, ate 2/3, no broth'">${esc(draft.note)}</textarea>
         <button class="btn ${draft.items.length ? '' : 'primary'} block" data-m="analyze" ${canAnalyze ? '' : 'disabled'}>
-          ${busy === 'analyze' ? spinner + ' Analyzing…' : draft.items.length ? '↻ Re-analyze with AI' : '✦ Analyze with AI'}</button>
+          ${busy === 'analyze' ? spinner + ' Analyzing… <span data-ai-timer class="num"></span>' : draft.items.length ? '↻ Re-analyze with AI' : '✦ Analyze with AI'}</button>
+        ${busy ? BG_HINT : ''}
         ${draft.items.length ? `
           <div class="totals"><div><b data-t="kcal">${fmt(t.kcal)}</b><span class="xs muted">kcal</span></div>
             <div><b data-t="protein" style="color:var(--protein)">${n0(t.protein)}</b><span class="xs muted">protein g</span></div>
@@ -755,7 +792,9 @@ async function openMealSheet({ id, type }) {
     if (!b || b.disabled) return;
     const m = b.dataset.m;
     if (m === 'cancel') {
-      if (!existing && draft.items.length && !confirm('Discard this meal?')) return;
+      if (busy && !confirm('The AI is still working on this meal. Stop waiting and discard it?')) return;
+      if (!busy && !existing && draft.items.length && !confirm('Discard this meal?')) return;
+      busy = false; stopAiTimer();
       closeSheet();
     } else if (m === 'type') { draft.type = b.dataset.v; paint(); }
     else if (m === 'rm-photo') { photos.delete(b.dataset.id); paint(); }
@@ -776,21 +815,21 @@ async function openMealSheet({ id, type }) {
       paint();
     }
     else if (m === 'analyze') {
-      busy = 'analyze'; paint();
+      busy = 'analyze'; startAiTimer(); paint();
       try {
         const label = C.MEAL_TYPES.find((x) => x.key === draft.type).label;
         applyResult(await AI.analyzeMeal({ images: [...photos.values()], mealType: label, note: draft.note }));
         if (AI.lastProvider()?.includes('backup')) toast(`Used ${AI.lastProvider()}`);
       } catch (err) { toast(err.message); }
-      busy = false; paint();
+      busy = false; stopAiTimer(); paint();
     } else if (m === 'refine') {
       if (!refineText.trim()) return toast('Type what to change first');
-      busy = 'refine'; paint();
+      busy = 'refine'; startAiTimer(); paint();
       try {
         applyResult(await AI.refineMeal({ items: draft.items, note: draft.note, correction: refineText }));
         refineText = '';
       } catch (err) { toast(err.message); }
-      busy = false; paint();
+      busy = false; stopAiTimer(); paint();
     } else if (m === 'delete') {
       if (!confirm('Delete this meal?')) return;
       draft.photoIds.forEach(deletePhoto);
@@ -980,7 +1019,8 @@ async function finishDay() {
   const d = ui.date;
   const el = openSheet({ persistent: true });
   el.innerHTML = `<div class="sheet-head"><span></span><h2>Day review</h2><span style="width:50px"></span></div>
-    <div class="sheet-body center" style="padding:48px 16px"><div class="row" style="justify-content:center">${spinner}<span class="muted">Reviewing your day…</span></div></div>`;
+    <div class="sheet-body center" style="padding:48px 16px"><div class="row" style="justify-content:center">${spinner}<span class="muted">Reviewing your day… <span data-ai-timer class="num"></span></span></div>${BG_HINT}</div>`;
+  startAiTimer();
   const ctx = reviewContext(d);
   let review, note = '';
   try {
@@ -990,6 +1030,7 @@ async function finishDay() {
     review = localReview(ctx);
     note = `AI unavailable (${err.message}). Showing an offline summary.`;
   }
+  stopAiTimer();
   S.days[d] = { closed: true, closedAt: Date.now(), review, stale: false };
   save(); render();
   el.innerHTML = `<div class="sheet-head"><span style="width:50px"></span><h2>Day review</h2><button class="link strong" data-x="close">Done</button></div>
@@ -1168,7 +1209,7 @@ async function uploadLocalPhotos(s) {
 // ---------- boot ----------
 async function boot() {
   S = await loadLocal();
-  AI.configure(() => S.settings, (m) => { S.settings.model = m; save(); });
+  AI.configure(() => S.settings, (m) => { S.settings.model = m; save(); }, (p) => { aiRun.provider = p; });
   render();
   cloud.init({
     onUser,
