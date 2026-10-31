@@ -1,6 +1,6 @@
 // Offline support: network-first for app files (so updates show up), cache fallback when offline.
 // Versioned SDK files (Firebase, Anthropic) are cached on first use so they load offline too.
-const CACHE = 'fitlog-v5';
+const CACHE = 'fitlog-v6';
 const ASSETS = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
   'js/app.js', 'js/ai.js', 'js/calc.js', 'js/charts.js', 'js/db.js', 'js/cloud.js', 'js/firebase-config.js',

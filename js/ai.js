@@ -12,7 +12,8 @@ export const CLAUDE_MODELS = [
 ];
 export const DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5';
 
-// Hard per-attempt limits so a stuck connection fails (and can fall back) instead of spinning forever.
+// Per-attempt limits for Claude, so a stuck connection fails instead of spinning forever.
+// Gemini has no limit: its free tier can take minutes, and the user prefers to wait for the answer.
 const TIMEOUT_MS = { images: 60_000, text: 35_000 };
 
 let getSettings = () => ({});
@@ -83,16 +84,17 @@ function toGeminiSchema(s) {
   return out;
 }
 
-// Light thinking keeps answers fast; the field differs between Gemini generations.
+// Photo analysis and reviews use the model's default (full) thinking; quick text edits think lightly.
 function thinkingFor(model, effort) {
-  if (/^gemini-2\.5/.test(model)) return { thinkingBudget: effort === 'low' ? 0 : 1024 };
+  if (effort !== 'low') return null;
+  if (/^gemini-2\.5/.test(model)) return { thinkingBudget: 0 };
   if (/^gemini-[3-9]/.test(model)) return { thinkingLevel: 'low' };
   return null;
 }
 
 async function geminiOnce(model, apiKey, body, timeoutMs) {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  const timer = timeoutMs ? setTimeout(() => ctl.abort(), timeoutMs) : null;
   try {
     const r = await fetch(`${GEMINI}/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
@@ -222,7 +224,7 @@ async function generate(req) {
     const entry = { at: new Date().toISOString(), task: req.task, provider: PROVIDERS[p].name, images: req.images.length };
     onStatus(PROVIDERS[p].name);
     try {
-      const text = await PROVIDERS[p].call(req, timeoutMs);
+      const text = await PROVIDERS[p].call(req, p === 'gemini' ? null : timeoutMs);
       let parsed;
       try { parsed = JSON.parse(text); } catch { throw new AIError('Could not read the AI answer.', { retryable: true }); }
       logAttempt({ ...entry, model: PROVIDERS[p].call.model, ms: Date.now() - started, ok: true });

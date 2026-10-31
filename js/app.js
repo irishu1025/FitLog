@@ -719,8 +719,6 @@ async function openMealSheet({ id, type }) {
         <button class="link strong" data-m="save" ${busy ? 'disabled' : ''}>Save</button></div>
       <div class="sheet-body">
         <div class="seg">${C.MEAL_TYPES.map((m) => `<button data-m="type" data-v="${m.key}" class="${draft.type === m.key ? 'on' : ''}">${m.label}</button>`).join('')}</div>
-        ${index.foods.length ? `<input type="search" data-f="search" value="${esc(query)}" placeholder="Search foods you've logged before (no AI)" autocomplete="off">
-          <div id="m-sugg">${draft.items.length && !query ? '' : suggestionsHtml()}</div>` : ''}
         <div class="photo-grid">
           ${[...photos].map(([pid, src]) => `<div class="photo"><img src="${src}" alt=""><button class="x" data-m="rm-photo" data-id="${pid}" aria-label="Remove">×</button></div>`).join('')}
           <label class="photo-add"><b>+</b>Photo<input type="file" accept="image/*" multiple hidden data-m-file></label>
@@ -738,6 +736,9 @@ async function openMealSheet({ id, type }) {
           <div class="row"><input data-f="refine" placeholder="Adjust in words: 'rice was half a bowl'" value="${esc(refineText)}" class="grow">
             <button class="btn" data-m="refine" ${busy ? 'disabled' : ''}>${busy === 'refine' ? spinner : 'Apply'}</button></div>` : ''}
         <div class="stack">${draft.items.map(itemHtml).join('')}</div>
+        ${index.foods.length ? `<div class="label" style="margin-top:20px">Or pick from your foods</div>
+          <input type="search" data-f="search" value="${esc(query)}" placeholder="Search foods you've logged before (no AI)" autocomplete="off">
+          <div id="m-sugg">${draft.items.length && !query ? '' : suggestionsHtml()}</div>` : ''}
         <button class="btn ghost block" data-m="add-item">+ Add item manually</button>
         ${existing ? '<button class="btn danger block" data-m="delete">Delete meal</button>' : ''}
       </div>`;
